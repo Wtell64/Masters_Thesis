@@ -1,0 +1,247 @@
+---
+title: "Thesis Simulation"
+author: "Aras Mentese"
+date: "5/4/2022"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+
+
+###
+# Original simulation study study
+# Parameters
+```{r}
+n <- c(10,25,50,75)
+q <- 50
+p <- 50
+
+topologies <- c( "watts","barabasi","random") # "watts-strogatz","barabasi",
+est_methods <- c(2,5)
+replicates <- 20
+densities <- c("sparse","dense") # Two settings
+```
+
+
+
+```{r}
+start <- Sys.time()
+#use arrays
+# For method 2
+set.seed(1234)
+max_it <- length(est_methods) * length(topologies) * length(n) *length(densities)
+Results<- matrix(NA,max_it,10)
+colnames(Results) <- c("Density", "Topoplogy", "Method", "Sample_Size", "Sensitivity", "Specificity", "F1-Score","MCC", "F_Loss", "Q_Loss")
+
+count <- 1
+for (mat_dens in densities) {
+ for (topology in topologies) {
+   
+   ifelse( (mat_dens == 0.25), put <- "sparse", put <- "dense") 
+ 
+   P_Y <- read.csv(paste0("Prec_Y_",topology,"_",put,".csv"))
+   P_Y <- as.matrix(P_Y)
+   colnames(P_Y) <- rownames(P_Y)
+   
+   P_X <- read.csv(paste0("Pre_X_",topology,"_",put,".csv"))
+   P_X <- as.matrix(P_X)
+   colnames(P_X) <- rownames(P_X)
+    for (est_method in est_methods) {
+        for (n_size in n) {
+          
+           print(paste("Considering: ", "Estimation Method = ", est_method,"Sample size = " , n_size,"Topology = " , topology, "Density = ",mat_dens))
+            metrics <- matrix(0, ncol = 4, nrow = replicates)
+            F_L <- 0
+            Q_L <- 0
+            # Do the experiments
+            for (replicate in 1:replicates) {
+            # Experiments with sparse setting
+            # Sometimes method 2 stops cause of Varimax not converging, so we tract that and skip that replication
+ 
+            
+            experiment <- Experiment_function(Pre_X = P_X, Prec_Y = P_Y, est_met = est_method, n = n_size)
+
+            metrics[replicate , ] <-  matrix(unlist(experiment[[1]]),1,4) # If we did not fail, we save the experiment result
+            F_L <- F_L + experiment[[2]]
+            Q_L <- Q_L + experiment[[3]]
+
+#Put try here
+            } # replicate
+            metrics[is.nan(metrics)] <- 0
+            
+            Results[count,5:8] <- round(colSums(metrics) / replicates,2 ) 
+            Results[count, 1:4] <- c(mat_dens,topology, est_method, n_size)
+            Results[count, 9] <- round((F_L / replicates),2 )# norm
+            Results[count, 10] <- round((Q_L / replicates), 2)# loss
+            print(paste("Simulation Progress: ", round((count/ max_it) * 100,2), "%"))
+            count <- count + 1
+           
+            
+      } # Sample size
+    } # Method
+  } # Topology
+} # Densities
+print("Done")
+(Sys.time() - start) / replicates
+
+
+Results_df <- data.frame(Results)
+#Results_df[which(Results_df["Density"] == 1), "Density"] <- "Sparse"
+#Results_df[which(Results_df["Density"] == 2), "Density"] <- "Dense"
+
+write.csv(Results_df, "Results_df_20rep_m2vsm5.csv", row.names=FALSE)
+```
+
+
+
+
+# Testing sample size
+
+```{r}
+n <- c(75,100,125)
+q <- 50
+p <- 55
+
+topologies <- c("random","barabasi","watts-strogatz")
+est_methods <- c(1,2,3,4)
+replicates <- 20
+densities <- c(1,2) # Two settings
+```
+
+```{r}
+
+#use arrays
+# For method 2
+set.seed(1234)
+max_it <- length(est_methods) * length(topologies) * length(n) *length(densities)
+Results<- matrix(NA,max_it,9)
+colnames(Results) <- c("Density", "Topoplogy", "Method", "Sample_Size", "Sensitivity", "Specificity", "F1-Score","MCC", "Fails")
+
+count <- 1
+# It will be Barabassi (10,25,50) > 
+for (mat_dens in densities) {
+ for (topology in topologies) {
+    for (est_method in est_methods) {
+      for (n_size in n) {
+            # Store the experiments
+            experiment <- matrix(0, ncol = 4, nrow = 1)
+            # Create the True population Precision for the specific setting
+            Prec <- Prec_function( p = p , q = q, topologies = topology, dens = mat_dens, blk_num = 4)
+            P_Y <- Prec$Prec_Y
+            P_X <- Prec$Pre_X
+
+            # Do the experiments
+            
+            fails <- 0
+            exp_count <- 0
+            for (replicate in 1:replicates) {
+            # Experiments with sparse setting
+            
+            t <- try(Experiment_function(Pre_X = P_X, Prec_Y = P_Y, est_met = est_method, n = n_size) , silent = TRUE)  
+            if("try-error" %in% class(t)) tmp <- matrix(0,1,4)
+            if("try-error" %in% class(t)) fails <- fails + 1
+            if(!("try-error" %in% class(t))) tmp <- Experiment_function(Pre_X = P_X, Prec_Y = P_Y, est_met = est_method, n = n_size)
+            if(!("try-error" %in% class(t)))exp_count <-  exp_count + 1
+            experiment <- experiment + tmp
+#Put try here
+            } # replicate
+
+            Results[count,5:8] <- round(matrix(unlist(experiment),1,4) / exp_count, 2)
+            Results[count, 1:4] <- c(mat_dens,topology, est_method, n_size)
+            Results[count, 9] <- fails
+            print(paste("Simulation Progress: ", round((count/ max_it) * 100,2), "%"))
+            count <- count + 1
+            print(paste("Considering: ", "Estimation Method = ", est_method,"Sample size = " , n_size,"Topology = " , topology))
+            
+      } # Sample size
+    } # Method
+  } # Topology
+} # Densities
+print("Done")
+
+
+```
+
+```{r}
+Results_df_sample <- data.frame(Results)
+Results_df_sample[which(Results_df_sample["Density"] == 1), "Density"] <- "Sparse"
+Results_df_sample[which(Results_df_sample["Density"] == 2), "Density"] <- "Dense"
+```
+
+```{r}
+save(Results_df_sample,file="Results_df_sample.csv")
+write.csv(Results_df_sample, "Results_df_sample.csv", row.names=FALSE, quote=FALSE)
+```
+
+# Real life data
+
+
+# dump 
+
+
+```{r}
+start <- Sys.time()
+#use arrays
+# For method 2
+set.seed(1234)
+max_it <- length(est_methods) * length(topologies) * length(n) *length(densities)
+Results<- matrix(NA,max_it,11)
+colnames(Results) <- c("Density", "Topoplogy", "Method", "Sample_Size", "Sensitivity", "Specificity", "F1-Score","MCC", "Norm", "Loss", "Fails")
+
+count <- 1
+# It will be Barabassi (10,25,50) > 
+for (mat_dens in densities) {
+ for (topology in topologies) {
+    for (est_method in est_methods) { #go down
+      for (n_size in n) { # go down 
+            # Store the experiments
+            experiment <- matrix(0, ncol = 4, nrow = 1)
+            losses <- 0
+            norms <- 0
+            # Create the True population Precision for the specific setting
+            Prec <- Prec_function( p = p , q = q, topologies = topology, dens = mat_dens, blk_num = 4)
+            P_Y <- Prec$Prec_Y
+            P_X <- Prec$Pre_X
+
+            # Do the experiments
+            
+            fails <- 0
+            exp_count <- 0
+            for (replicate in 1:replicates) {
+            # Experiments with sparse setting
+            # Sometimes method 2 stops cause of Varimax not converging, so we tract that and skip that replication
+            t <- try(Experiment_function(Pre_X = P_X, Prec_Y = P_Y, est_met = est_method, n = n_size) , silent = TRUE)  
+            if("try-error" %in% class(t)) tmp <- matrix(0,1,4) # If algorithm fails don't do any experiment
+            if("try-error" %in% class(t)) fails <- fails + 1 # Count failed algoritmh replications
+            if(!("try-error" %in% class(t))){
+              metrics <- t[[1]] # If we did not fail, we save the experiment result
+              norms <- t[[2]]
+              losses <- t[[3]]
+              exp_count <-  exp_count + 1 # we keep a success count to get average
+            } 
+
+            experiment <- experiment + metrics # add succesful experiments
+#Put try here
+            } # replicate
+
+            Results[count,5:8] <- round(matrix(unlist(experiment),1,4) / exp_count, 2)
+            Results[count, 1:4] <- c(mat_dens,topology, est_method, n_size)
+            Results[count, 9] <- round((norms / exp_count),2 )# norm
+            Results[count, 10] <- round((losses / exp_count), 2)# loss
+            Results[count, 11] <- fails
+            print(paste("Simulation Progress: ", round((count/ max_it) * 100,2), "%"))
+            count <- count + 1
+            print(paste("Considering: ", "Estimation Method = ", est_method,"Sample size = " , n_size,"Topology = " , topology))
+            
+      } # Sample size
+    } # Method
+  } # Topology
+} # Densities
+print("Done")
+(Sys.time() - start) / replicates
+
+```

@@ -1,0 +1,67 @@
+---
+title: "Untitled"
+author: "Aras Mentese"
+date: "6/3/2022"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# To read the datas
+# Use paste0 to read them automaticly
+#a <- read.csv("Prec_Y_barabasi_dense.csv")
+
+```
+
+```{r}
+topologies <- c("random","watts","barabasi")
+densities <- c(0.25,0.50)
+replicates <- 100
+```
+
+```{r}
+p <- 50
+q <- 50
+set.seed(1234)
+Cross_yx <- matrix(runif(p*q, 0.1,0.3),p,q) * matrix(sample(c(0,1), p*q, replace = TRUE, prob = c(2/3,1/3)),p ,q)
+for (topology in topologies) {
+  for (dens in densities) {
+    print(paste("Now doing", topology, dens ))
+
+    max_average <- 0
+    count <- 0
+    q <- 50
+    p <- 50
+
+
+    Final_Prec_Y <- matrix(NA,p,p)
+    Final_Pre_X <- matrix(NA,p,p)
+    while (count <= replicates) {
+       t <- try(Pres <- Precision_create_fun(top = topology, density_t = dens))
+       while("try-error" %in% class(t)){
+          t <- try(Pres <- Pres <- Precision_create_fun(top = topology, density_t = dens)) 
+       }
+    P_Y <- Pres$Prec_Y
+    Pre_X <- Pres$Pre_X
+
+      if(sum(P_Y - diag(p)) / length(P_Y[P_Y != 0]) > max_average) {
+         Final_Prec_Y <- P_Y
+         Final_Pre_X <-Pre_X
+         max_average <- sum(P_Y - diag(p)) / length(P_Y[P_Y != 0])
+         print("max changed")
+      }
+   count <- count + 1 
+   print(count)
+    }
+    if (dens == 0.25) put <- "sparse" 
+    if (dens == 0.50) put <- "dense" 
+    write.csv(Final_Prec_Y, paste0("Prec_Y_",topology,"_",put,".csv"), row.names = FALSE)
+    write.csv(Final_Pre_X,  paste0("Pre_X_",topology,"_",put,".csv"), row.names=FALSE)
+  } # Density end
+} # Topology end
+
+write.csv(Cross_yx, "Cross_cov.csv", row.names = FALSE)
+```

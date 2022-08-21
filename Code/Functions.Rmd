@@ -1,0 +1,640 @@
+---
+title: "Untitled"
+author: "Aras Mentese"
+date: "4/25/2022"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+
+library("rags2ridges") # for ridge estimation of precision matrix
+library("FMradio") # For regularized factor analysis
+library("MASS") # for mmultivariate normal distribution
+library("caret")  # for confusion matrix/sensitivity
+library("clusterGeneration") # Generates pos def matrices
+library("Matrix") # To make a matrix symmetric 
+library("lqmm")
+library("cglasso")
+library("BDgraph")
+
+library("fdrtool")
+
+Pre_conditioner <- function(Pre){
+    p <- dim(Pre)[1]
+    Pre <- symm(Pre)
+    lambda_and_cn <-CNplot(Pre, lambdaMin = 0.0001, lambdaMax = 10, step = 1000, nOutput = TRUE, type = "Alt" )
+    condNR <- lambda_and_cn$conditionNumbers
+    dLoss <- floor(log10(condNR))
+    accuracy <- 2
+    new_acc <- which(dLoss == accuracy)
+    adjustment <- FALSE
+    if (length(new_acc) == 0) adjustment <- TRUE
+    if (length(new_acc) == 0) accuracy <- 1
+    while (adjustment == TRUE) { # check if 2 is possible if not set to one and increase while it does not exist
+      new_acc <- which(dLoss == accuracy)
+      if (length(new_acc) != 0) adjustment <- FALSE
+      if (length(new_acc) == 0)  accuracy <- accuracy + 1
+    }
+    
+    selected_index <- new_acc[1]
+    selected_lambda <- lambda_and_cn$lambda[selected_index]
+    out <- matrix(symm(ridgeP(Pre, type = "Alt", lambda = selected_lambda)),p,p)
+    return(out)
+    }
+
+
+
+Method_one <- function(X,Y, assess = FALSE){
+
+  #Random variables of matrices
+  q <- dim(X)[2]
+  p <- dim(Y)[2]
+  
+
+  Z <- cbind(Y,X)
+
+  ## Get the precision matrix for Z
+  OPT <- optPenalty.kCVauto(Z, fold = 5, lambdaMin = 1e-07, 
+  lambdaMax = 20, target = default.target(covML(Z), type = "DAPV"))
+  
+  conditional_precision_Y <- OPT$optPrec[1:p,1:p]
+  
+  if (assess == TRUE) { # Print the assessment plots
+    CNplot(covML(Z), lambdaMin = 1e-07, lambdaMax = 20,
+    step = 5000,
+    target = default.target(covML(Z), type = "DAPV"),
+    Iaids = TRUE,
+    vertical = TRUE, value = OPT$optLambda)
+  }
+  
+  return(list(precision = conditional_precision_Y, lambda = OPT$optLambda))
+}
+
+
+Method_two <- function(X,Y, assess = FALSE){
+  #############################################
+  # X is the n x q main matrix
+  # Y is the n x p matrix we will use to condition on X
+  # Z is the merged matrix
+  #############################################
+  # First use factor analysis to project Y matrix on a lower dimension
+  # Create the Z matrix
+  # Do an optimal regularization on covariance on Z
+  # Get the top left submatrix on the Z precision matrix
+  # Output the conditional precision matrix
+  
+  
+  # To get the scaling matrix 
+  
+  scaling_matrix <- diag(diag(covML(Y)^(-0.5)))
+
+  
+  #Random variables of matrices
+  q <- dim(X)[2]
+  p <- dim(Y)[2]
+  n <- dim(Y)[1]
+  #Do factor analysis to get projected Y
+  
+  #scale Y and get corr 
+  X_scaled <-  scale(X)
+  R <- cor(X_scaled)
+  #Find optimal regularization coefficient
+  #opt_fold <- ifelse(n > 125, 25, 10)
+  OPT <- regcor(X_scaled, fold = 5, verbose = FALSE) # Gives warning "the standard deviation is zero"
+  Re <- OPT$optCor
+  m <-as.numeric(dimGB(Re, graph = FALSE, verbose = FALSE)[1])
+
+  # ML factor analysis with Varimax rotation
+  low <- 0.05
+  fito <- try(mlFA_altered(R = Re, m = m, low = low) , silent = TRUE)
+  while ("try-error" %in% class(t)) {
+      low <- low + 0.05
+      fito <- try(mlFA_altered(R = Re, m = m, low = low) , silent = TRUE)
+    }
+  
+  # Factor scores
+  Lambda <- fito$Loadings
+  Psi    <- fito$Uniqueness
+  Scores <- facScore(X_scaled, Lambda, Psi)
+  
+  
+  FA_X <- matrix(unlist(Scores),dim(Scores[1]),dim(Scores[2]))
+  
+ 
+  #scaled_Y <- scale(Y)
+  #Create Z matrix / change scale part
+  Z <- cbind(Y,FA_X)
+  #Since each matrix is sclaed, this part does not need scaling 
+ 
+  ## Get the precision matrix for Z
+  OPT <- optPenalty.kCVauto(Z, fold = 5, lambdaMin = 1e-07,
+  lambdaMax = 20, target = default.target(covML(Z), type = "DAPV"))
+  
+  #print(paste("Optimal Lambda for Z matrix is: ",OPT$optLambda))
+  
+  conditional_precision_Y <- OPT$optPrec[1:p,1:p]
+  
+  #conditional_upscaled_precision_Y <- scaling_matrix %*% conditional_precision_Y %*% scaling_matrix
+  
+  if (assess == TRUE) { # Print the assessment plots
+    CNplot(covML(Z), lambdaMin = 1e-07, lambdaMax = 40,
+    step = 5000,
+    target = default.target(covML(Z), type = "DAPV"),
+    Iaids = TRUE,
+    vertical = TRUE, value = OPT$optLambda)
+  }
+
+  return(list(precision = conditional_precision_Y, lambda = OPT$optLambda))
+}
+  
+
+Method_three <- function(X,Y, assess = FALSE) {
+  #############################################
+  # X is the n x p main matrix
+  # Y is the n x q matrix we will use to condition on X
+  # Z is the merged matrix
+  #############################################
+  # Use individual penalization on Covx and Covy
+  # Estimate precision of X and Y
+  # Inverse the precision of X to get penalized covX
+  # Use Schur compliment to get the conditional X covariance matrix
+  # Inverse the conditional covariance matrix of X to get conditional precision      #matrix
+  #############################################
+
+  
+  #Random variables of matrices
+  q <- dim(X)[2]
+  p <- dim(Y)[2]
+  n <- dim(X)[1]
+  #Create Z matrix
+  
+  covyx <- t(Y) %*% X
+  covyx <- covyx /  (n - 1) #length(X)
+  covxy <- t(X) %*% Y
+  covxy <- covxy / (n - 1)#length(X)
+  
+  # To convert the estimates back to covariance scale
+  #scale_y <- diag(diag(covML(Y))^(0.5))
+  
+  #scale_x <- diag(diag(covML(X))^(-0.5))
+  
+
+  #covyx <- cov(Y,X)
+  #covxy <- cov(X,Y)
+  
+  #Precision estimation for covx and get covarianc x
+  OPT_x <- optPenalty.kCVauto(X, fold = 5, lambdaMin = 1e-07,
+  lambdaMax = 50, target = default.target(covML(X), type = "DAPV"))
+  
+  pen_pres_X <- OPT_x$optPrec
+  X_lambda <-  OPT_x$optLambda
+  
+  
+  #Precision estimation for covx and get covarianc x
+  OPT_y <- optPenalty.kCVauto(Y, fold = 5, lambdaMin = 1e-07,
+  lambdaMax = 50, target = default.target(covML(Y), type = "DAPV"))
+  
+  Y_lambda <-  OPT_y$optLambda
+  pen_covY <- solve(OPT_y$optPrec)
+  
+    if (assess == TRUE) { # Print the assessment plots
+    CNplot(covML(X), lambdaMin = 1e-07, lambdaMax = 40,
+    step = 5000,
+    target = default.target(covML(X), type = "DAPV"),
+    Iaids = TRUE,
+    vertical = TRUE, value = X_lambda)
+      
+    CNplot(covML(Y), lambdaMin = 1e-07, lambdaMax = 40,
+    step = 5000,
+    target = default.target(covML(Y), type = "DAPV"),
+    Iaids = TRUE,
+    vertical = TRUE, value = Y_lambda)
+  }
+  
+  #pen_pres_X <- scale_x %*% pen_pres_X %*% scale_x
+  
+  
+  #pen_covY <- scale_y %*% pen_covY %*% scale_y
+  
+
+  # Calculate the Schur Complement analytically 
+
+  cond_covy <- symm(pen_covY - (covyx %*% pen_pres_X %*% covxy))
+  
+  #cond_covy_s <- symm(scale(cond_covy))
+
+  #condition_number <-conditionNumberPlot(cond_covy, lambdaMin = .0001, lambdaMax = 50, step = 1000, nOutput = TRUE, verbose = FALSE)
+
+  #condition_differences <- abs(diff(condition_number$conditionNumbers))
+  
+  #opt_lambda <- condition_number$lambdas[condition_differences < 1]
+  #if (length(opt_lambda) != 0) opt_lambda <- opt_lambda[1]
+  #if (length(opt_lambda) == 0)  opt_lambda <- max(condition_number$lambdas)
+  #precision_y <- symm(ridgeP(cond_covy, opt_lambda))
+  
+  #while(any(eigen(cond_covy)$values < 0)){
+  #  cond_covy <- cond_covy + diag(p)
+  #}
+  
+  #precision_y <- symm(solve(cond_covy))
+  precision_y <- Pre_conditioner(cond_covy)
+  
+  return(list(precision = precision_y ,penalty_X =  X_lambda,penalty_Y =  Y_lambda))
+}
+
+
+Confusionmetrics <- function(a,b, threshold){
+  #a <- Sign_function(a, threshold)
+  #b <- Sign_function(b, threshold)
+  a <- adjacentMat(a)
+  b <- adjacentMat(b)
+
+  
+  confusion <- matrix(0,2,2)
+  colnames(confusion) <- c("reference = 0","reference = 1")
+  rownames(confusion) <- c("predicted = 0", "predicted = 1")
+  confusion[1,1] <- sum(which(b == 0) %in% which(a == 0))
+  confusion[2,2] <- sum(which(b != 0) %in% which(a != 0))
+  confusion[1,2] <- sum(which(b != 0) %in% which(a == 0))
+  confusion[2,1] <- sum(which(b == 0) %in% which(a != 0)) 
+  
+  tp <- confusion[2,2]
+  tn <- confusion[1,1]
+  fp <- confusion[2,1]
+  fn <- confusion[1,2]
+  sens <- tp / (tp + fn)
+  spec <- tn / (tn + fp)
+
+  mcc <- (tp * tn - fp * fn) / (sqrt((tp + fp)) * sqrt((tp + fn)) * sqrt((tn + fp)) * sqrt(tn + fn))
+  f1_score <- tp / (tp + 0.5 *(fp + fn))
+  return(list(Confusion_matrix  = confusion,
+              Confusion_metrics = data.frame( Sensitivity = sens,
+                                             Specificity = spec,  F1_score = f1_score, MCC = mcc)))
+}
+
+Round_function <- function(X) {
+  X[abs(X) <= 10^-4] <- 0
+  return(symm(X))
+}
+
+
+
+Sparsify_noverbose <- function(P,
+  threshold = c("absValue", "connected", "localFDR", "top"),
+  absValueCut = 0.25,
+  FDRcut = 0.9,
+  top = 10,
+  output = "heavy",
+  verbose = TRUE) {
+  
+  if (!is.matrix(P)) {
+        stop("Input (P) should be a matrix")
+    }
+    else if (!isSymmetric(P)) {
+        stop("Input (P) should be a symmetric matrix")
+    }
+    else if (!evaluateS(P, verbose = FALSE)$posEigen) {
+        stop("Input (P) is expected to be positive definite")
+    }
+    else if (missing(threshold)) {
+        stop("Need to specify type of sparsification ('absValue' or 'localFDR' ", 
+            "or 'connected' or 'top')")
+    }
+    else if (!(threshold %in% c("absValue", "connected", 
+        "localFDR", "top"))) {
+        stop("Input (threshold) should be one of\n         {'absValue', 'connected', 'localFDR', 'top'}")
+    }
+    else if (!(output %in% c("light", "heavy"))) {
+        stop("Input (output) should be one of {'light', 'heavy'}")
+    }
+    else {
+        if (all(length(unique(diag(P))) == 1 & unique(diag(P)) == 
+            1)) {
+            stan = TRUE
+            PC <- P
+        }
+        else {
+            stan = FALSE
+            PC <- symm(pcor(P))
+        }
+        NR <- (ncol(P) * (ncol(P) - 1))/2
+        if (threshold == "top") {
+            if (class(top) != "numeric") {
+                stop("Input (top) is of wrong class")
+            }
+            else if (length(top) != 1) {
+                stop("Input (top) must be a scalar")
+            }
+            else if (!.is.int(top)) {
+                stop("Input (top) should be a numeric integer")
+            }
+            else if (top <= 0) {
+                stop("Input (top) must be strictly positive")
+            }
+            else if (top >= NR) {
+                stop("Input (top) must be smaller than the number of nonredundant ", 
+                  "off-diagonal elements of the input matrix P")
+            }
+            else {
+                absValueCut <- sort(abs(PC[upper.tri(PC)]), decreasing = TRUE)[ceiling(top)]
+                threshold <- "absValue"
+            }
+        }
+        if (threshold == "connected") {
+            sumPC <- summary(abs(PC[upper.tri(PC)]))
+            maxPC <- as.numeric(sumPC[6])
+            minPC <- as.numeric(sumPC[1])
+            for (j in 1:100) {
+                absValueCut <- (maxPC + minPC)/2
+                PC0 <- PC
+                PC0[!(abs(PC0) >= absValueCut)] <- 0
+                if (igraph::is.connected(graph.adjacency(adjacentMat(PC0), 
+                  "undirected"))) {
+                  minPC <- absValueCut
+                }
+                else {
+                  maxPC <- absValueCut
+                }
+                if (abs(absValueCut - (maxPC + minPC)/2) < 10^(-10)) {
+                  absValueCut <- minPC
+                  break
+                }
+            }
+            threshold <- "absValue"
+        }
+        if (threshold == "absValue") {
+            if (class(absValueCut) != "numeric") {
+                stop("Input (absValueCut) is of wrong class")
+            }
+            else if (length(absValueCut) != 1) {
+                stop("Input (absValueCut) must be a scalar")
+            }
+            else if (absValueCut <= 0 | absValueCut >= 1) {
+                stop("Input (absValueCut) must be in the interval (0,1)")
+            }
+            else {
+                PC0 <- PC
+                PC0[!(abs(PC0) >= absValueCut)] <- 0
+                if (!stan) {
+                  P0 <- P
+                  P0[PC0 == 0] <- 0
+                }
+            }
+        }
+        if (threshold == "localFDR") {
+            if (class(FDRcut) != "numeric") {
+                stop("Input (FDRcut) is of wrong class")
+            }
+            else if (length(FDRcut) != 1) {
+                stop("Input (FDRcut) must be a scalar")
+            }
+            else if (FDRcut <= 0 | FDRcut >= 1) {
+                stop("Input (FDRcut) must be in the interval (0,1)")
+            }
+            else if (class(verbose) != "logical") {
+                stop("Input (verbose) is of wrong class")
+            }
+            else {
+                lFDRs <- 1 - fdrtool(PC[upper.tri(PC)], "correlation", 
+                  plot = verbose, verbose = verbose)$lfdr
+                PC0 <- diag(nrow(PC))
+                PC0[lower.tri(PC0)] <- 1
+                zeros <- which(PC0 == 0, arr.ind = TRUE)
+                zeros <- zeros[which(lFDRs <= FDRcut), ]
+                PC0 <- PC
+                PC0[zeros] <- 0
+                PC0[cbind(zeros[, 2], zeros[, 1])] <- 0
+                if (!stan) {
+                  P0 <- P
+                  P0[PC0 == 0] <- 0
+                }
+            }
+        }
+        NNZ <- length(which(PC0[upper.tri(PC0)] != 0))
+        #cat("- Retained elements: ", NNZ, "\n")
+        #cat("- Corresponding to", round(NNZ/NR, 4) * 100, 
+        #    "% of possible edges \n")
+        #cat(" \n")
+        if (output == "heavy") {
+            if (stan) {
+                colnames(PC0) = rownames(PC0) <- colnames(P)
+                return(PC0)
+            }
+            if (!stan) {
+                colnames(PC0) = rownames(PC0) <- colnames(P)
+                colnames(P0) = rownames(P0) <- colnames(P)
+                return(list(sparseParCor = PC0, sparsePrecision = P0))
+            }
+        }
+        if (output == "light") {
+            return(list(zeros = which(PC0 == 0, arr.ind = TRUE), 
+                nonzeros = which(PC0 != 0, arr.ind = TRUE)))
+        }
+    }
+  
+}
+
+# Function to create the true Precision 
+Prec_function <- function(n, p ,q , topologies, dens, blk_num, threshold){
+  
+# Create the Marginal Precision matrices
+Pre_Y <- create_precision(p = p , method = topologies, density_p = dens, block_num = blk_num) 
+Pre_X <- create_precision(p = q , method = topologies, density_p = dens, block_num = blk_num)
+
+
+Pre_Y <- Pre_Y + (sign(Pre_Y) - diag(p)) * 5
+
+scale_x <- diag(sqrt(diag(Pre_X)^-1))
+Pre_X <- scale_x %*% Pre_X %*% scale_x
+
+#values_x <- eigen(Pre_X)$values
+#while (min(values_x) < .01) {
+#          Pre_X <- Pre_conditioner(Pre_X)
+#          values_x <- eigen(Pre_X)$values
+#    }
+
+# Round the noice to 0 (due to G-Wishard sampling of non-zero elements)
+Pre_Y <- Round_function(Pre_Y)
+Pre_X <- Round_function(Pre_X)
+# Create the Cross covariance structure
+#Cross_yx <- Cross_cov_function(Pre_Y,Pre_X)
+Cross_yx <- matrix(runif(p*q, 0.1,0.3),p,q) * matrix(sample(c(0,1), p*q, replace = TRUE, prob = c(2/3,1/3)),p ,q)
+# Schur complement to get conditional Covariance matrix
+Covc_Y <- solve(Pre_Y) - Cross_yx %*% Pre_X %*% t(Cross_yx)
+# Conditional Precision matrix
+Prec_Y <- solve(Covc_Y)
+
+
+
+
+return(list(Pre_X = Pre_X, Prec_Y = Prec_Y))
+}
+
+# Function for an experiment
+Experiment_function <- function (Pre_X,Prec_Y, est_met, n) { 
+
+p <- dim(Prec_Y)[1]
+q <- dim(Pre_X)[1]
+
+X <- mvrnorm(n, rep(0,q), symm(solve(Pre_X)))
+Y <- mvrnorm(n, rep(0,p), symm(solve(Prec_Y)))  
+
+if (est_met == 1) {
+  conditional_precision_Y <- Method_one(X,Y, assess = FALSE)
+  P1 <- sparsify(symm(conditional_precision_Y$precision), threshold = "localFDR" ,absValueCut = 0.05, FDRcut = 0.8, verbose = FALSE)
+confusion_matrix <- Confusionmetrics(P1$sparsePrecision, Prec_Y)
+confusion_matrix <- confusion_matrix$Confusion_metrics
+Q_L <- loss(symm(P1$sparsePrecision), symm(Prec_Y) , "quadratic", precision = TRUE)
+F_L <- loss(symm(P1$sparsePrecision), symm(Prec_Y) , "frobenius", precision = TRUE)
+return(list(confusion_matrix,F_L, Q_L ))
+}
+if (est_met == 2) {
+  conditional_precision_Y <- Method_two(X,Y, assess = FALSE) # threshold = "absValue",absValueCut = 0.05
+  P1 <- sparsify(symm(conditional_precision_Y$precision),threshold =  "localFDR",absValueCut = 0.05, FDRcut = 0.8, verbose = FALSE)
+confusion_matrix <- Confusionmetrics(P1$sparsePrecision, Prec_Y)
+confusion_matrix <- confusion_matrix$Confusion_metrics
+
+Q_L <- loss(symm(P1$sparsePrecision), symm(Prec_Y) , "quadratic", precision = TRUE)
+F_L <- loss(symm(P1$sparsePrecision), symm(Prec_Y) , "frobenius", precision = TRUE)
+
+#out <- list()
+#out[[1]] <- confusion_matrix
+#out[[2]] <- F_L
+#out[[3]] <- Q_L
+return(list(confusion_matrix,F_L, Q_L ))
+}
+if (est_met == 3) {
+  conditional_precision_Y <- Method_three(X,Y, assess = FALSE)
+  P1 <- sparsify(symm(conditional_precision_Y$precision),threshold =  "localFDR",absValueCut = 0.05 , FDRcut = 0.8, verbose = FALSE)
+confusion_matrix <- Confusionmetrics(P1$sparsePrecision, Prec_Y)
+confusion_matrix <- confusion_matrix$Confusion_metrics
+
+Q_L <- loss(symm(P1$sparsePrecision), symm(Prec_Y) , "quadratic", precision = TRUE)
+F_L <- loss(symm(P1$sparsePrecision), symm(Prec_Y) , "frobenius", precision = TRUE)
+
+out <- list()
+out[[1]] <- confusion_matrix
+out[[2]] <- F_L
+out[[3]] <- Q_L
+return( out )
+}
+if (est_met == 4) {
+Z <- datacggm(Y = Y, X = X)
+cglasso_est <- cglasso(. ~ .,data = Z , maxit.em = 20000, maxit.bcd = 20000)
+cglasso_est <- cggm(cglasso_est, lambda.id = 3L, rho.id = 3L , maxit.em = 20000,maxit.bcd = 20000 )
+cglasso_est <- matrix(cglasso_est$Tht,p,p)  
+confusion_matrix <- Confusionmetrics(cglasso_est, Prec_Y)
+confusion_matrix <- confusion_matrix$Confusion_metrics
+
+Q_L <- loss(symm(cglasso_est), symm(Prec_Y) , "quadratic", precision = TRUE)
+F_L <- loss(symm(cglasso_est), symm(Prec_Y) , "frobenius", precision = TRUE)
+
+return(list(confusion_matrix, F_L, Q_L))
+}
+if (est_met == 5) {
+estimate <- optPenalty.kCVauto(Y, fold = 5, lambdaMin = 1e-07,
+lambdaMax = 50, target = default.target(covML(Y), type = "DAPV"))
+P1 <- sparsify(symm(estimate$optPrec),threshold = "localFDR",absValueCut = 0.05, FDRcut = 0.8 ,verbose = FALSE)
+confusion_matrix <- Confusionmetrics(P1$sparsePrecision, Prec_Y)
+confusion_matrix <- confusion_matrix$Confusion_metrics
+
+Q_L <- loss(symm(P1$sparsePrecision), symm(Prec_Y) , "quadratic", precision = TRUE)
+F_L <- loss(symm(P1$sparsePrecision), symm(Prec_Y) , "frobenius", precision = TRUE)
+
+
+return(list(confusion_matrix, F_L, Q_L))
+}
+}
+
+ 
+
+mlFA_altered <- function(R, m, low = .005){
+
+  p    <- ncol(R)
+  mmax <- floor((2*p + 1 - sqrt(8*p + 1))/2)
+  if (!is.matrix(R)){
+    stop("Input (R) should be a matrix")
+  }
+  if (nrow(R) != ncol(R)){
+    stop("Input (R) should be square matrix")
+  }
+  if (class(m) != "numeric" & class(m) != "integer"){
+    stop("Input (m) is of wrong class")
+  }
+  if (length(m) != 1){
+    stop("Length input (m) must be one")
+  }
+  if (m <= 1){
+    stop("Input (m) cannot be lower than 1")
+  }
+  if (m > mmax){
+    stop("Input (m) is too high")
+  }
+  # Wrapper
+  fit <- factanal(factors = m, covmat = R, rotation = "varimax", lower = low)
+  # Return
+  rotmatrix <- fit$rotmat
+  rownames(rotmatrix) <- colnames(fit$loadings)
+  colnames(rotmatrix) <- rownames(rotmatrix)
+  return(list(Loadings = fit$loadings, Uniqueness = diag(fit$uniquenesses),rotmatrix = rotmatrix))
+}
+
+Precision_create_fun <- function(topology, density_t){
+
+ratio <- 0
+while(ratio < density_t) {
+if(topology == "random"){
+adj <- graph.sim(p = p, graph = "random", prob = .3)
+}
+if(topology == "watts"){
+G <- watts.strogatz.game(1, p, nei = 6, 1,p = 0.05)
+adj <- get.adjacency(G, sparse = FALSE)
+}
+if (topology == "barabasi"){
+G <- barabasi.game(p, power = 1, m = 3, directed = FALSE)
+adj <- get.adjacency(G, sparse = FALSE)
+}
+Pre_Y <- adj * 0.6 + diag(p)
+Pre_X <- adj * 0.3 + diag(p)
+
+while (min(eigen(Pre_X)$values) < 0.1){
+  diag(Pre_X) <- diag(Pre_X) + 0.05
+}
+
+# Schur complement to get conditional Covariance matrix
+Covc_Y <- solve(Pre_Y) - Cross_yx %*% Pre_X %*% t(Cross_yx)
+# Conditional Precision matrix
+Prec_Y <- solve(Covc_Y)
+P_Y <- Prec_Y
+ratio <- (sum(P_Y != 0) - p) / (length(P_Y) - p)
+}
+threshold <- 0.005
+ratio <- (sum(P_Y != 0) - p) / (length(P_Y) - p)
+while (ratio >= density_t) {
+  threshold <- threshold + 0.005
+  P_Y[P_Y < threshold ] <- 0 
+  diags  <- diag(P_Y) 
+  average_diag <- mean(diags[which(diag(P_Y) != 0)])
+  diags[which(diag(P_Y) == 0)] <- average_diag
+  diag(P_Y) <- diags
+  ratio <- (sum(P_Y != 0) - p) / length(P_Y)
+}
+
+while (min(eigen(P_Y)$values) < 0.1){
+  diag(P_Y) <- diag(P_Y) + 0.05
+}
+
+scale <- diag(sqrt(diag(P_Y)^-1))
+P_Y <- scale %*% P_Y %*% scale
+
+scale_x <- diag(sqrt(diag(Pre_X)^-1))
+Pre_X <- scale_x %*% Pre_X %*% scale_x
+return(list(Prec_Y = P_Y, Pre_X = Pre_X))
+}
+
+
+```
